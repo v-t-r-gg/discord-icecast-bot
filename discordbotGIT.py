@@ -7,26 +7,25 @@ from discord import Activity, ActivityType, Embed
 from aiohttp import ClientTimeout, ClientPayloadError
 from discord.ui import View, Button
 import urllib.parse
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 bot = commands.Bot(command_prefix='!', intents=intents)
-
 class StreamCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.metadata_task = None
+        self.timeout_task = None
         self.current_title = ""
         self.song_history = []
         self.N = 50
         self.session = aiohttp.ClientSession(timeout=ClientTimeout(connect=10, sock_read=20))
-
     async def cog_unload(self):
         await self.session.close()
         if self.metadata_task:
             self.metadata_task.cancel()
-
+        if self.timeout_task:
+            self.timeout_task.cancel()
     async def update_metadata(self):
         url = 'YOUR_STREAM_URL_HERE'
         headers = {'Icy-MetaData': '1'}
@@ -70,11 +69,33 @@ class StreamCog(commands.Cog):
                     await asyncio.sleep(10)
         except asyncio.CancelledError:
             pass
-
+    async def timeout_disconnect(self, vc):
+        await asyncio.sleep(300)
+        if vc.is_connected():
+            non_bots = [m for m in vc.channel.members if not m.bot]
+            if len(non_bots) == 0:
+                await vc.disconnect()
+                if self.metadata_task:
+                    self.metadata_task.cancel()
+                await self.bot.change_presence(activity=None)
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after):
+        if not self.bot.voice_clients:
+            return
+        vc = self.bot.voice_clients[0]
+        if vc.channel != before.channel and vc.channel != after.channel:
+            return
+        non_bots = [m for m in vc.channel.members if not m.bot]
+        if len(non_bots) == 0:
+            if self.timeout_task is None or self.timeout_task.done():
+                self.timeout_task = asyncio.create_task(self.timeout_disconnect(vc))
+        else:
+            if self.timeout_task and not self.timeout_task.done():
+                self.timeout_task.cancel()
+                self.timeout_task = None
     @commands.Cog.listener()
     async def on_disconnect(self):
         print("bot dc, reconnecting")
-
     @commands.command()
     async def play(self, ctx):
         if self.metadata_task:
@@ -89,6 +110,10 @@ class StreamCog(commands.Cog):
                 vc = await channel.connect()
             else:
                 vc = ctx.voice_client
+            non_bots = [m for m in vc.channel.members if not m.bot]
+            if len(non_bots) == 0:
+                if self.timeout_task is None or self.timeout_task.done():
+                    self.timeout_task = asyncio.create_task(self.timeout_disconnect(vc))
             vc.play(discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(
                 'YOUR_STREAM_URL_HERE',
                 before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin',
@@ -96,15 +121,15 @@ class StreamCog(commands.Cog):
             ), volume=0.5))
         except Exception as e:
             await ctx.send(f"Voice error: {e}")
-
     @commands.command()
     async def stop(self, ctx):
         if self.metadata_task:
             self.metadata_task.cancel()
+        if self.timeout_task:
+            self.timeout_task.cancel()
         if ctx.voice_client:
             await ctx.voice_client.disconnect()
         await self.bot.change_presence(activity=None)
-
     @commands.command()
     async def history(self, ctx):
         if not self.song_history:
@@ -123,7 +148,6 @@ class StreamCog(commands.Cog):
             return
         view = PaginatorView(pages)
         await view.send(ctx)
-
     @commands.command()
     async def song(self, ctx):
         if not self.current_title:
@@ -173,17 +197,15 @@ class StreamCog(commands.Cog):
         except Exception as e:
             print(f"Song API error: {e}")
         await ctx.send(embed=embed)
-
     @commands.command()
     async def help(self, ctx):
         embed = Embed(title="Bot Commands")
-        embed.add_field(name="!play", value="play stream", inline=False)
+        embed.add_field(name="!play", value="start stream", inline=False)
         embed.add_field(name="!stop", value="stop & dc", inline=False)
         embed.add_field(name="!history", value="last 10 tunes", inline=False)
         embed.add_field(name="!song", value="show album info", inline=False)
         embed.add_field(name="!help", value="this menu lol", inline=False)
         await ctx.send(embed=embed)
-
 class PaginatorView(View):
     def __init__(self, embeds):
         super().__init__(timeout=300)
@@ -193,18 +215,19 @@ class PaginatorView(View):
         self.add_item(Button(label="<", style=discord.ButtonStyle.primary, custom_id="prev"))
         self.add_item(Button(label=">", style=discord.ButtonStyle.primary, custom_id="next"))
         self.add_item(Button(label=">>", style=discord.ButtonStyle.primary, custom_id="last"))
-
     async def send(self, ctx):
         await self.update_message()
         self.message = await ctx.send(embed=self.embeds[0], view=self)
-
     async def update_message(self):
         self.children[0].disabled = self.current_page == 0
         self.children[1].disabled = self.current_page == 0
         self.children[2].disabled = self.current_page == len(self.embeds) - 1
         self.children[3].disabled = self.current_page == len(self.embeds) - 1
         self.embeds[self.current_page].set_footer(text=f"Page {self.current_page + 1}/{len(self.embeds)}")
-
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        await self.message.edit(view=self)
     async def interaction_check(self, interaction):
         if interaction.data['custom_id'] == 'first':
             self.current_page = 0
@@ -217,10 +240,8 @@ class PaginatorView(View):
         await self.update_message()
         await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
         return True
-
 async def main():
     bot.remove_command("help")
     await bot.add_cog(StreamCog(bot))
     await bot.start('YOUR_BOT_TOKEN_HERE')
-
 asyncio.run(main())
